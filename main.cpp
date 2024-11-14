@@ -5,7 +5,7 @@
 #include <llvm/IR/ConstantRange.h>
 #include <vector>
 
-// TODO is this the best way to handle bitwidth?
+// TODO likely a better way to parameterize bitwidth
 #define BITWIDTH 4
 
 void print_abst_range(const llvm::ConstantRange &x) {
@@ -78,15 +78,41 @@ std::vector<llvm::APInt> to_concrete(const llvm::ConstantRange &x) {
 }
 
 // TODO find some way to ensure this always returns the smallest range
-// maybe by pre-sorting, tho idk if that works for wrapped values
+// this function tries out a few methods but there are no gaurentees
 llvm::ConstantRange to_abstract(const std::vector<llvm::APInt> &conc_vals) {
-  auto ret = llvm::ConstantRange::getEmpty(BITWIDTH);
+  auto ret0 = llvm::ConstantRange::getEmpty(BITWIDTH);
+  auto ret1 = llvm::ConstantRange::getEmpty(BITWIDTH);
+  auto ret2 = llvm::ConstantRange::getEmpty(BITWIDTH);
+  int largest_gap = 0;
+  int largest_gap_idx = 0;
 
   for (auto x : conc_vals) {
-    ret = ret.unionWith(llvm::ConstantRange(x));
+    ret0 = ret0.unionWith(x);
   }
 
-  return ret;
+  for (auto it = conc_vals.rbegin(); it != conc_vals.rend(); ++it) {
+    ret1 = ret1.unionWith(*it);
+  }
+
+  auto smallestRet = ret1.isSizeStrictlySmallerThan(ret0) ? ret1 : ret0;
+  if (conc_vals.size() > 1) {
+    for (size_t i = 0; i < conc_vals.size() - 1; ++i) {
+      auto gap = llvm::APIntOps::abds(conc_vals[i], conc_vals[i + 1]);
+      if (gap.uge(largest_gap)) {
+        largest_gap = gap.getSExtValue();
+        largest_gap_idx = i;
+      }
+    }
+
+    for (size_t i = 0; i < conc_vals.size(); ++i) {
+      ret2 = ret2.unionWith(llvm::ConstantRange(
+          conc_vals[(i + largest_gap_idx + 1) % conc_vals.size()]));
+    }
+
+    return ret2.isSizeStrictlySmallerThan(smallestRet) ? ret2 : smallestRet;
+  }
+
+  return smallestRet;
 }
 
 std::vector<llvm::APInt> sort_n_dedup_vals(std::vector<llvm::APInt> x) {
@@ -110,28 +136,19 @@ std::vector<llvm::APInt> concrete_sdiv(const std::vector<llvm::APInt> &lhss,
 
   for (auto lhs : lhss) {
     for (auto rhs : rhss) {
-      // TODO this avoids potential UB
-      // maybe it should return some kind of top instead??
+      // this check refines div by zero UB
       if (rhs == z)
         continue;
-      // TODO this avoids potential UB
-      // maybe it should return some kind of top instead??
-      // TODO pt2. these values are hardcoded based on the bitwidth and must
-      // change to support other widths
-      // if (lhs == llvm::APInt(BITWIDTH, -4) && rhs == llvm::APInt(BITWIDTH,
-      // -1))
+      // this check refines singed int wrapping UB
+      // TODO these values are hardcoded based on the bitwidth and must
       if (lhs == llvm::APInt(BITWIDTH, -8) && rhs == llvm::APInt(BITWIDTH, -1))
         continue;
+
       ret.push_back(lhs.sdiv(rhs));
     }
   }
 
-  // TODO this is done to just get unique vals
-  // but further testing is needed to see how to get the smallest range from a
-  // list of these vals
-  ret = sort_n_dedup_vals(ret);
-
-  return ret;
+  return sort_n_dedup_vals(ret);
 }
 
 int compare_abst(const llvm::ConstantRange &lhs, const llvm::ConstantRange &rhs,
@@ -146,197 +163,36 @@ int compare_abst(const llvm::ConstantRange &lhs, const llvm::ConstantRange &rhs,
 
   std::vector<llvm::APInt> conc_llvm = to_concrete(llvm);
 
-  // TODO one (or more?) of these cases should check for the unsoundness of llvm
-  //
-  // case 1 -- llvm is a proper superset of brute (most likely)
-  bool case1 = true;
-  for (auto x : conc_brute) {
-    if (!llvm.contains(x))
-      case1 = false;
-  }
-  if (case1)
+  // case 1 -- incomparable sets of the same size
+  if (conc_llvm.size() == conc_brute.size())
     return 1;
-  // case 2 -- brute is a proper superset of llvm (def unsound)
-  bool case2 = true;
-  for (auto x : conc_llvm) {
-    if (std::count(conc_brute.begin(), conc_brute.end(), x) == 0)
-      case2 = false;
-  }
-  if (case2)
+  // case 2 -- incomparable sets where llvm's is bigger
+  if (conc_llvm.size() > conc_brute.size())
     return 2;
 
+  // case 3 -- incomparable sets where llvm's is smaller
   return 3;
-  // TODO do these cases later
-  // case 3 -- brute and llvm are incomperable but brute > llvm (may be unsound)
-  // case 4 -- brute and llvm are incomperable but brute < llvm (may be unsound)
-  // case 5 -- brute and llvm are incomperable but brute = llvm (may be unsound)
 }
 
 int main() {
-  int case0 = 0;
-  int case1 = 0;
-  int case2 = 0;
-  int case3 = 0;
+  std::vector<int> cases = {0, 0, 0, 0};
+  long long i = 0;
 
   for (auto lhs : enum_abst_vals()) {
     for (auto rhs : enum_abst_vals()) {
       auto transfer_vals = lhs.sdiv(rhs);
       auto brute_vals = concrete_sdiv(to_concrete(lhs), to_concrete(rhs));
       int caseNum = compare_abst(lhs, rhs, transfer_vals, brute_vals);
-      switch (caseNum) {
-      case 0:
-        case0++;
-        break;
-      case 1:
-        case1++;
-        break;
-      case 2:
-        case2++;
-        break;
-      case 3:
-        case3++;
-        break;
-      }
+      cases[caseNum]++;
+      i++;
     }
   }
 
-  printf("case 0: %i\n", case0);
-  printf("case 1: %i\n", case1);
-  printf("case 2: %i\n", case2);
-  printf("case 3: %i\n", case3);
+  printf("case 0: %i\n", cases[0]);
+  printf("case 1: %i\n", cases[1]);
+  printf("case 2: %i\n", cases[2]);
+  printf("case 3: %i\n", cases[3]);
+  printf("tests : %lld\n", i);
 
   return 0;
 }
-
-// Q's for john for class tmro
-//
-// Q1:
-// what to do about possible UB? could return top, or could just pretend that it
-// doesn't exist it looks like llvm pretends that it doesn't exist, and this
-// would still result in a refinement example: 3 bit signed division -4 / -1,
-// would be 4 but that's too wide for 3 bits doing this operation using APInts
-// returns -4 but idk
-//
-// Q2:
-// what if results are incomperable?
-// example in 3 bit signed integer division dividing the range
-// [3, 2) / [-1, 1) yeilds the exact set {-3, -1, 0, 1, 2, 3}
-// i.e. every value in i3 except for -4 and -2
-// this  could be represented by the range [-3, -4) (i.e. every value but -4;
-// correct and what llvm does) or it could be repersented by the range [-1, -2)
-// (i.e. every value but -2; correct and what my code does)
-//
-// Q2 pt2
-// When results are incomparable how do I check for soundness?
-// I could check that every value contained in my concrete set is contained
-// within the llvm range should we do that for the assingment
-
-// GRAVEYARD
-// llvm::ConstantRange to_abstract_old(const std::vector<llvm::APInt> &x) {
-//   if (x.empty())
-//     return llvm::ConstantRange::getEmpty(BITWIDTH);
-//
-//   llvm::APInt minElem =
-//       *std::min_element(x.begin(), x.end(), [](llvm::APInt a, llvm::APInt b)
-//       {
-//         return a.getSExtValue() < b.getSExtValue();
-//       });
-//
-//   llvm::APInt maxElem =
-//       *std::max_element(x.begin(), x.end(), [](llvm::APInt a, llvm::APInt b)
-//       {
-//         return a.getSExtValue() < b.getSExtValue();
-//       });
-//
-//   return llvm::ConstantRange(
-//       minElem,
-//       maxElem.isNegative() && (minElem != maxElem) ? maxElem - 1 : maxElem +
-//       1);
-// }
-//
-// compare_abst_old {
-//   std::vector<llvm::APInt> llvm_m_brute{};
-//   std::set_difference(conc_llvm.begin(), conc_llvm.end(), conc_brute.begin(),
-//                       conc_brute.end(), back_inserter(llvm_m_brute),
-//                       [](const llvm::APInt &a, const llvm::APInt &b) {
-//                         return a.getSExtValue() != b.getSExtValue();
-//                       });
-//   std::vector<llvm::APInt> brute_m_llvm{};
-//   std::set_difference(conc_brute.begin(), conc_brute.end(),
-//   conc_llvm.begin(),
-//                       conc_llvm.end(), back_inserter(brute_m_llvm),
-//                       [](const llvm::APInt &a, const llvm::APInt &b) {
-//                         return a.getSExtValue() != b.getSExtValue();
-//                       });
-//
-//   if (!brute_m_llvm.empty()) {
-//     printf("lhs: ");
-//     print_abst_range(lhs);
-//     printf("rhs: ");
-//     print_abst_range(rhs);
-//     printf("brute - llvm: ");
-//     print_conc_range(brute_m_llvm);
-//     printf("llvm - brute: ");
-//     print_conc_range(llvm_m_brute);
-//     printf("brute vals: ");
-//     print_conc_range(conc_brute);
-//     printf("brute range: ");
-//     print_abst_range(brute);
-//   puts("----------------------------");
-//   return 1;
-//   }
-//   else {
-//     if (!conc_brute.empty())
-//       return 1;
-//     else {
-//
-//       printf("lhs: ");
-//       print_abst_range(lhs);
-//       printf("rhs: ");
-//       print_abst_range(rhs);
-//       printf("brute - llvm: ");
-//       print_conc_range(brute_m_llvm);
-//       printf("llvm - brute: ");
-//       print_conc_range(llvm_m_brute);
-//       printf("brute vals: ");
-//       print_conc_range(conc_brute);
-//       printf("brute range: ");
-//       print_abst_range(brute);
-//       puts("----------------------------");
-//       return 0;
-//     }
-//   }
-//   printf("llvm:  ");
-//   print_abst_range(llvm);
-//   printf("brute: ");
-//   print_abst_range(brute);
-//   printf("llvm - brute: ");
-//   print_conc_range(llvm_m_brute);
-//   printf("brute - llvm: ");
-//   print_conc_range(brute_m_llvm);
-//   puts("----------------------------");
-// }
-//
-// old_main {
-//   puts("");
-//   auto lhsx =
-//       llvm::ConstantRange(llvm::APInt(BITWIDTH, 3), llvm::APInt(BITWIDTH,
-//       2));
-//   auto rhsx =
-//       llvm::ConstantRange(llvm::APInt(BITWIDTH, -1), llvm::APInt(BITWIDTH,
-//       1));
-//   printf("lhs: ");
-//   print_conc_range(to_concrete(lhsx));
-//   printf("rhs: ");
-//   print_conc_range(to_concrete(rhsx));
-//   auto brute_vals = concrete_sdiv(to_concrete(lhsx), to_concrete(rhsx));
-//   printf("brute force vals: ");
-//   print_conc_range(brute_vals);
-//   auto llvm_vals = lhsx.sdiv(rhsx);
-//   printf("llvm vals conc:   ");
-//   print_conc_range(to_concrete(llvm_vals));
-//   printf("llvm vals:  ");
-//   print_abst_range(llvm_vals);
-//   printf("brute vals: ");
-//   print_abst_range(to_abstract(brute_vals));
-// }
