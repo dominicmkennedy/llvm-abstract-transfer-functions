@@ -1,51 +1,63 @@
-#include <algorithm>
 #include <cmath>
+#include <concepts>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <llvm/ADT/APInt.h>
-#include <llvm/IR/ConstantRange.h>
+#include <llvm/Support/KnownBits.h>
 #include <vector>
 
-// TODO likely a better way to parameterize bitwidth
-#define BITWIDTH 4
+template <typename T>
+concept APIntContainer = requires(T t) {
+  typename T::value_type;
+  requires std::same_as<typename T::value_type, llvm::APInt>;
+  requires std::ranges::range<T>;
+};
 
-void print_abst_range(const llvm::ConstantRange &x) {
-  printf("[%ld, %ld)", x.getLower().getSExtValue(),
-         x.getUpper().getSExtValue());
-  if (x.isFullSet())
+// TODO provied hashing and ordering func for llvm APInts
+
+void print_abst_range(const llvm::KnownBits &x) {
+  for (int32_t i = x.Zero.getBitWidth() - 1; i >= 0; --i) {
+    const char bit = x.One[i] ? '1' : x.Zero[i] ? '0' : '?';
+    printf("%c", bit);
+  }
+
+  if (x.isConstant())
+    printf(" const %lu", x.getConstant().getZExtValue());
+
+  if (x.isUnknown())
     printf(" (top)");
-  if (x.isEmptySet())
-    printf(" (bottom)");
+
+  printf("\n");
+}
+
+// TODO consider either set or generic container
+// TODO consider printing full/top if it is
+void print_conc_range(const APIntContainer auto &x) {
+  if (x.empty())
+    printf("empty");
+
+  for (llvm::APInt i : x)
+    printf("%ld ", i.getZExtValue());
+
   puts("");
 }
 
-void print_conc_range(const std::vector<llvm::APInt> &x) {
-  if (x.empty()) {
-    puts("empty");
-    return;
-  }
-  for (llvm::APInt i : x) {
-    printf("%ld ", i.getSExtValue());
-  }
-  puts("");
-}
+// TODO there's a faster way to this but this works for now
+// would also be nice if this moved up the lattice as the loops progressed
+std::vector<llvm::KnownBits> const enum_abst_vals(const uint32_t bitwidth) {
+  const llvm::APInt min = llvm::APInt::getSignedMinValue(bitwidth);
+  const llvm::APInt max = llvm::APInt::getSignedMaxValue(bitwidth);
+  std::vector<llvm::KnownBits> ret;
 
-// TODO this function is super hacky but whatev
-std::vector<llvm::ConstantRange> enum_abst_vals() {
-  std::vector<llvm::ConstantRange> ret = std::vector<llvm::ConstantRange>();
-  llvm::APInt min = llvm::APInt::getSignedMinValue(BITWIDTH);
-  llvm::APInt max = llvm::APInt::getSignedMaxValue(BITWIDTH);
+  for (auto i = min;; ++i) {
+    for (auto j = min;; ++j) {
+      auto x = llvm::KnownBits(bitwidth);
+      x.One = i;
+      x.Zero = j;
 
-  for (llvm::APInt i = min;; ++i) {
-    for (llvm::APInt j = min;; ++j) {
-      if (i == j && !(i.isMaxValue() || i.isMinValue())) {
-        if (j == max)
-          break;
-        else
-          continue;
-      }
-
-      // print_abs_range(llvm::ConstantRange(i, j));
-      ret.push_back(llvm::ConstantRange(i, j));
+      if (!x.hasConflict())
+        ret.push_back(x);
 
       if (j == max)
         break;
@@ -57,141 +69,81 @@ std::vector<llvm::ConstantRange> enum_abst_vals() {
   return ret;
 }
 
-// TODO also a lil hacky function but whatev
-std::vector<llvm::APInt> to_concrete(const llvm::ConstantRange &x) {
+// TODO return a generic container based on what the caller asks for
+// TODO there's a faster way to this but this works for now
+std::vector<llvm::APInt> const to_concrete(const llvm::KnownBits &x) {
   std::vector<llvm::APInt> ret = std::vector<llvm::APInt>();
+  const llvm::APInt min = llvm::APInt::getZero(x.Zero.getBitWidth());
+  const llvm::APInt max = llvm::APInt::getMaxValue(x.Zero.getBitWidth());
 
-  if (x.isFullSet()) {
-    for (llvm::APInt i = llvm::APInt::getSignedMinValue(BITWIDTH);
-         i != llvm::APInt::getSignedMaxValue(BITWIDTH); ++i)
+  for (auto i = min;; ++i) {
+
+    if (!x.Zero.intersects(i) && !x.One.intersects(~i))
       ret.push_back(i);
 
-    ret.push_back(llvm::APInt::getSignedMaxValue(BITWIDTH));
-
-    return ret;
+    if (i == max)
+      break;
   }
-
-  for (llvm::APInt i = x.getLower(); i != x.getUpper(); ++i)
-    ret.push_back(i);
 
   return ret;
 }
 
-// TODO find some way to ensure this always returns the smallest range
-// this function tries out a few methods but there are no gaurentees
-llvm::ConstantRange to_abstract(const std::vector<llvm::APInt> &conc_vals) {
-  auto ret0 = llvm::ConstantRange::getEmpty(BITWIDTH);
-  auto ret1 = llvm::ConstantRange::getEmpty(BITWIDTH);
-  auto ret2 = llvm::ConstantRange::getEmpty(BITWIDTH);
-  int largest_gap = 0;
-  int largest_gap_idx = 0;
+llvm::KnownBits const to_abstract(const APIntContainer auto &conc_vals) {
+  auto ret = llvm::KnownBits::makeConstant(conc_vals[0]);
 
   for (auto x : conc_vals) {
-    ret0 = ret0.unionWith(x);
+    ret = ret.intersectWith(llvm::KnownBits::makeConstant(x));
   }
 
-  for (auto it = conc_vals.rbegin(); it != conc_vals.rend(); ++it) {
-    ret1 = ret1.unionWith(*it);
-  }
-
-  auto smallestRet = ret1.isSizeStrictlySmallerThan(ret0) ? ret1 : ret0;
-  if (conc_vals.size() > 1) {
-    for (size_t i = 0; i < conc_vals.size() - 1; ++i) {
-      auto gap = llvm::APIntOps::abds(conc_vals[i], conc_vals[i + 1]);
-      if (gap.uge(largest_gap)) {
-        largest_gap = gap.getSExtValue();
-        largest_gap_idx = i;
-      }
-    }
-
-    for (size_t i = 0; i < conc_vals.size(); ++i) {
-      ret2 = ret2.unionWith(llvm::ConstantRange(
-          conc_vals[(i + largest_gap_idx + 1) % conc_vals.size()]));
-    }
-
-    return ret2.isSizeStrictlySmallerThan(smallestRet) ? ret2 : smallestRet;
-  }
-
-  return smallestRet;
+  return ret;
 }
 
-std::vector<llvm::APInt> sort_n_dedup_vals(std::vector<llvm::APInt> x) {
-  std::sort(x.begin(), x.end(), [](const llvm::APInt &a, const llvm::APInt &b) {
-    return a.getSExtValue() < b.getSExtValue();
-  });
-
-  auto last = std::unique(x.begin(), x.end());
-  x.erase(last, x.end());
-
-  return x;
-}
-
-std::vector<llvm::APInt> concrete_sdiv(const std::vector<llvm::APInt> &lhss,
-                                       const std::vector<llvm::APInt> &rhss) {
+// TODO parameterize this function to do any concret APInt oporation
+// TODO parameterize for any generic std container
+// TODO have some automated check for UB?
+std::vector<llvm::APInt> const
+concrete_op(const std::vector<llvm::APInt> &lhss,
+            const std::vector<llvm::APInt> &rhss) {
   auto ret = std::vector<llvm::APInt>();
-  if (lhss.size() == 0 || rhss.size() == 0)
-    return ret;
 
-  llvm::APInt z = llvm::APInt::getZero(lhss[0].getBitWidth());
+  for (auto lhs : lhss)
+    for (auto rhs : rhss)
+      ret.push_back(lhs ^ rhs);
 
-  for (auto lhs : lhss) {
-    for (auto rhs : rhss) {
-      // this check refines div by zero UB
-      if (rhs == z)
-        continue;
-      // this check refines singed int wrapping UB
-      // TODO these values are hardcoded based on the bitwidth and must
-      if (lhs == llvm::APInt(BITWIDTH, -8) && rhs == llvm::APInt(BITWIDTH, -1))
-        continue;
-
-      ret.push_back(lhs.sdiv(rhs));
-    }
-  }
-
-  return sort_n_dedup_vals(ret);
+  return ret;
 }
 
-int compare_abst(const llvm::ConstantRange &lhs, const llvm::ConstantRange &rhs,
-                 const llvm::ConstantRange &llvm,
-                 const std::vector<llvm::APInt> &conc_brute) {
+// TODO make case enum
+int compare(const llvm::KnownBits &approx,
+            const std::vector<llvm::APInt> &exact) {
 
-  llvm::ConstantRange brute = to_abstract(conc_brute);
+  const auto exact_abst = to_abstract(exact);
 
-  // case 0 -- both methods produced excatly the same set
-  if (llvm == brute)
+  if (exact_abst == approx)
     return 0;
 
-  std::vector<llvm::APInt> conc_llvm = to_concrete(llvm);
-
-  // case 1 -- incomparable sets of the same size
-  if (conc_llvm.size() == conc_brute.size())
-    return 1;
-  // case 2 -- incomparable sets where llvm's is bigger
-  if (conc_llvm.size() > conc_brute.size())
-    return 2;
-
-  // case 3 -- incomparable sets where llvm's is smaller
-  return 3;
+  return 1;
 }
 
 int main() {
-  std::vector<int> cases = {0, 0, 0, 0};
+  const size_t bitwidth = 4;
+
+  // TODO make cases a real cpp enum
+  std::vector<int> cases = {0, 0};
   long long i = 0;
 
-  for (auto lhs : enum_abst_vals()) {
-    for (auto rhs : enum_abst_vals()) {
-      auto transfer_vals = lhs.sdiv(rhs);
-      auto brute_vals = concrete_sdiv(to_concrete(lhs), to_concrete(rhs));
-      int caseNum = compare_abst(lhs, rhs, transfer_vals, brute_vals);
+  for (auto lhs : enum_abst_vals(bitwidth)) {
+    for (auto rhs : enum_abst_vals(bitwidth)) {
+      const auto transfer_vals = lhs ^ rhs;
+      const auto brute_vals = concrete_op(to_concrete(lhs), to_concrete(rhs));
+      const int caseNum = compare(transfer_vals, brute_vals);
       cases[caseNum]++;
       i++;
     }
   }
 
-  printf("case 0: %i\n", cases[0]);
-  printf("case 1: %i\n", cases[1]);
-  printf("case 2: %i\n", cases[2]);
-  printf("case 3: %i\n", cases[3]);
+  printf("case 0 (same): %i\n", cases[0]);
+  printf("case 1 (diff): %i\n", cases[1]);
   printf("tests : %lld\n", i);
 
   return 0;
